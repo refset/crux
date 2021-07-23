@@ -119,13 +119,21 @@
      (search* lucene-store
               (parse-query lucene-store query opts)))))
 
-(defn pred-constraint [query-builder results-resolver {:keys [arg-bindings idx-id return-type tuple-idxs-in-join-order ::lucene-store]}]
+(defn pred-constraint [query-builder results-resolver {:keys [arg-bindings idx-id return-type tuple-idxs-in-join-order ::lucene-store] :as pred-ctx}]
   (fn pred-lucene-constraint [index-snapshot db idx-id->idx join-keys]
     (let [arg-bindings (map (fn [a]
                               (if (instance? VarBinding a)
                                 (q/bound-result-for-var index-snapshot a join-keys)
                                 a))
                             (rest arg-bindings))
+          {:keys [lucene-store-k] :as opts} (let [m (last arg-bindings)]
+                                              (when (map? m)
+                                                m))
+          arg-bindings (if opts
+                         (butlast arg-bindings)
+                         arg-bindings)
+          lucene-store (or (get pred-ctx lucene-store-k)
+                           lucene-store)
           query (query-builder (:analyzer lucene-store) arg-bindings)
           tuples (with-open [search-results ^crux.api.ICursor (search* lucene-store query)]
                    (->> search-results
@@ -154,7 +162,7 @@
           search-results))
 
 (defmethod q/pred-args-spec 'text-search [_]
-  (s/cat :pred-fn  #{'text-search} :args (s/spec (s/cat :attr keyword? :v (some-fn string? q/logic-var?))) :return (s/? :crux.query/binding)))
+  (s/cat :pred-fn  #{'text-search} :args (s/spec (s/cat :attr keyword? :v (some-fn string? q/logic-var?) :opts (s/? (some-fn map? q/logic-var?)))) :return (s/? :crux.query/binding)))
 
 (defmethod q/pred-constraint 'text-search [_ pred-ctx]
   (let [resolver (partial resolve-search-results-a-v (second (:arg-bindings pred-ctx)))]
@@ -182,7 +190,7 @@
     (.build b)))
 
 (defmethod q/pred-args-spec 'wildcard-text-search [_]
-  (s/cat :pred-fn #{'wildcard-text-search} :args (s/spec (s/cat :v (some-fn string? q/logic-var?))) :return (s/? :crux.query/binding)))
+  (s/cat :pred-fn #{'wildcard-text-search} :args (s/spec (s/cat :v (some-fn string? q/logic-var?) :opts (s/? (some-fn map? q/logic-var?)))) :return (s/? :crux.query/binding)))
 
 (defmethod q/pred-constraint 'wildcard-text-search [_ pred-ctx]
   (pred-constraint #'build-query-wildcard #'resolve-search-results-a-v-wildcard pred-ctx))
@@ -209,6 +217,7 @@
                         (.add (TextField. (keyword->k a), v, Field$Store/YES))
                         ;; Used for wildcard searches
                         (.add (TextField. field-crux-val, v, Field$Store/YES))
+                        ;; Used for eviction
                         (.add (TextField. field-crux-eid, (->hash-str e), Field$Store/YES))
                         ;; Used for wildcard searches
                         (.add (StringField. field-crux-attr, (keyword->k a), Field$Store/YES)))]]
@@ -295,7 +304,7 @@
                :secondary-indices :crux/secondary-indices
                :checkpointer (fn [_])}
    ::sys/before #{[:crux/tx-ingester]}}
-  [{:keys [^Path db-dir document-store analyzer indexer query-engine secondary-indices checkpointer fsync-frequency]}]
+  [{:keys [^Path db-dir document-store analyzer indexer query-engine secondary-indices checkpointer fsync-frequency] :as opts}]
   (let [directory (if db-dir
                     (FSDirectory/open db-dir)
                     (ByteBuffersDirectory.))
@@ -314,7 +323,10 @@
 
     ;; Ensure lucene index exists for immediate queries:
     (.commit index-writer)
-    (q/assoc-pred-ctx! query-engine ::lucene-store lucene-store)
+
+    (when-let [{:keys [::sys/module-key]} (meta opts)]
+      (when (= 1 (count module-key))
+        (q/assoc-pred-ctx! query-engine (first module-key) lucene-store)))
 
     (tx/register-index! secondary-indices
                         (latest-completed-tx-id index-writer)
